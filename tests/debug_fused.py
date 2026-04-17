@@ -89,7 +89,7 @@ if __name__ == '__main__':
     cache_dir = os.path.expanduser("~/.triton/cache")
     if os.path.exists(cache_dir):
         print(f"Clearing Triton cache: {cache_dir}")
-        shutil.rmtree(cache_dir)
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     # Single chunk, single head (minimal)
     debug_test(B=1, T=64, H=1, K=128, V=128)
