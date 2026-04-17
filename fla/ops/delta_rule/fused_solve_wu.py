@@ -36,19 +36,25 @@ import torch
 import triton
 import triton.language as tl
 
+import os
+
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_TMA_SUPPORTED, autotune_cache_kwargs, check_shared_mem
+
+# Match solve_tril's precision logic: on non-TMA hardware, always use 'ieee'
+FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
+DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})
 
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'DOT_PRECISION': lambda args: 'tf32' if IS_TF32_SUPPORTED else 'ieee',
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [4, 8]
         for num_stages in [2, 3, 4]
+        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
     **autotune_cache_kwargs,
