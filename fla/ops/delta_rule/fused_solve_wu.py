@@ -100,15 +100,15 @@ def fused_solve_wu_fwd_kernel(
     w_base = w + (bos * H + i_h) * K
     u_base = u + (bos * H + i_h) * V
 
-    # Load beta for this chunk [BT]
-    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-
-    # Beta sub-vectors for each 16-row group
-    b_beta_0 = b_beta[0:16]
-    b_beta_1 = b_beta[16:32]
-    b_beta_2 = b_beta[32:48]
-    b_beta_3 = b_beta[48:64]
+    # Load beta for this chunk in 4 sub-vectors (compatible with older Triton)
+    p_beta_0 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (16,), (0,))
+    p_beta_1 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
+    p_beta_2 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
+    p_beta_3 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
+    b_beta_0 = tl.load(p_beta_0, boundary_check=(0,))
+    b_beta_1 = tl.load(p_beta_1, boundary_check=(0,))
+    b_beta_2 = tl.load(p_beta_2, boundary_check=(0,))
+    b_beta_3 = tl.load(p_beta_3, boundary_check=(0,))
 
     # =========================================================================
     # Load 4 diagonal blocks of A [16,16] each
