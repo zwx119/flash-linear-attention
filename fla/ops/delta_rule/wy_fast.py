@@ -7,6 +7,7 @@ import triton.language as tl
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.solve_tril import solve_tril
+from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
 from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
@@ -182,7 +183,9 @@ def prepare_wy_repr_fwd(
     beta: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
     chunk_indices: torch.LongTensor | None = None,
+    use_fused_kernel: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # 🔥1: A = tril(β⊙KK^T) — always separate
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
@@ -191,20 +194,33 @@ def prepare_wy_repr_fwd(
         output_dtype=torch.float32,
         chunk_indices=chunk_indices,
     )
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        output_dtype=k.dtype,
-    )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+
+    if use_fused_kernel:
+        # 🔥2.3 (fused): solve_tril + recompute_w_u in one kernel
+        w, u, A = fused_solve_wu_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+    else:
+        # 🔥2 + 🔥3 (original): separate kernels
+        A = solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=k.dtype,
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
     return w, u, A
 
 
