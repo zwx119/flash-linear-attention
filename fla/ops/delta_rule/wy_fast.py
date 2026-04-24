@@ -1,5 +1,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -7,10 +9,10 @@ import triton.language as tl
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.solve_tril import solve_tril
-from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
 from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+USE_FUSED_SOLVE_WU = os.environ.get('FLA_USE_FUSED_SOLVE_WU', '1') != '0'
 
 
 @triton.heuristics({
@@ -183,7 +185,7 @@ def prepare_wy_repr_fwd(
     beta: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
     chunk_indices: torch.LongTensor | None = None,
-    use_fused_kernel: bool = True,
+    use_fused_kernel: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # 🔥1: A = tril(β⊙KK^T) — always separate
     A = chunk_scaled_dot_kkt_fwd(
@@ -195,7 +197,12 @@ def prepare_wy_repr_fwd(
         chunk_indices=chunk_indices,
     )
 
+    if use_fused_kernel is None:
+        use_fused_kernel = USE_FUSED_SOLVE_WU
+
     if use_fused_kernel:
+        from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
+
         # 🔥2.3 (fused): solve_tril + recompute_w_u in one kernel
         w, u, A = fused_solve_wu_fwd(
             k=k,

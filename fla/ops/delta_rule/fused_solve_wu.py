@@ -5,23 +5,27 @@
 # This kernel fuses 🔥2 (solve_tril: L_inv computation) and 🔥3 (recompute_w_u)
 # into a single kernel launch. Two independent sources of speedup:
 #
-# === 1. Interleaved off-diagonal TC with CC forward_sub ===
+# === 1. Intended CC/TC overlap schedule ===
 #
 # Original solve_tril does ALL 4 CC forward_sub blocks first, then ALL TC dots.
-# CC and TC never overlap. We reorder so off-diagonal TC is issued right after
-# its dependencies are ready, interleaved between CC blocks:
+# CC and TC never overlap. The target Hopper implementation should split the CTA
+# into cooperating CC and TC worker groups:
 #
 #   CC: forward_sub(block_1) → Ai_11
 #   CC: forward_sub(block_2) → Ai_22
-#   TC: Ai_21 = -Ai_22·A_21·Ai_11            (2 dots)  ← overlap with block_3 CC
-#   CC: forward_sub(block_3) → Ai_33
-#   TC: Ai_32, Ai_31                          (5 dots)  ← overlap with block_4 CC
-#   CC: forward_sub(block_4) → Ai_44
+#   TC group: Ai_21 = -Ai_22·A_21·Ai_11       (2 dots)
+#       overlaps with
+#   CC group: forward_sub(block_3) → Ai_33
+#   TC group: Ai_32, Ai_31                    (5 dots)
+#       overlaps with
+#   CC group: forward_sub(block_4) → Ai_44
 #   TC: Ai_43, Ai_42, Ai_41                   (9 dots)  ← no CC left
 #
-# On H100 (wgmma async), the 7 TC dots in steps 3+5 execute "for free" during
-# CC forward_sub. On A100 (mma sync), the reordering doesn't hurt but doesn't
-# help either — still correct, just no overlap.
+# This Triton prototype currently fuses solve_tril and recompute_w_u, and orders
+# the dependent work in the same logical sequence, but it does not explicitly
+# split warps/warp-groups or use named barriers to guarantee simultaneous CC and
+# TC execution. Proving true overlap requires a Hopper profile, and may require a
+# lower-level warp-specialized implementation.
 #
 # === 2. Eliminate L_inv HBM round-trip ===
 #
@@ -129,10 +133,11 @@ def fused_solve_wu_fwd_kernel(
     b_Ai_44 = -tl.where(m_A, tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32), 0)
 
     # =========================================================================
-    # CC-TC Interleaved: forward_sub (CC) interleaved with off-diagonal L_inv (TC)
+    # Logical CC-TC dependency order for L_inv.
     #
-    # On H100, wgmma is async: TC dots issued after block N can execute in
-    # parallel with block N+1's CC forward substitution.
+    # NOTE: this is a fused sequential prototype. A true overlap kernel should
+    # run the off-diagonal TC worker group concurrently with the next diagonal
+    # CC worker group and synchronize their 16x16 blocks explicitly.
     # =========================================================================
 
     # --- Block 1: forward substitution [CC] ---
