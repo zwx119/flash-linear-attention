@@ -5,6 +5,7 @@ This isolates the forward WY preparation hot section:
 
   original: solve_tril(A) + recompute_w_u(k, v, beta, Ai)
   fused:    fused_solve_wu(k, v, beta, A)
+  hopper:   hopper_solve_tril(A) + recompute_w_u(k, v, beta, Ai)
 
 The input A = tril(beta * K K^T) is precomputed once so both paths measure only
 the solve+WU region. Use Nsight Compute/System around this script to check
@@ -27,6 +28,7 @@ import torch
 
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
+from fla.ops.delta_rule.hopper_solve_tril import hopper_solve_tril
 from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd
 from fla.ops.utils.solve_tril import solve_tril
 
@@ -89,6 +91,17 @@ def run_fused(
     return fused_solve_wu_fwd(k=k, v=v, beta=beta, A=a_raw)
 
 
+def run_hopper(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    a_raw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ai = hopper_solve_tril(A=a_raw, cu_seqlens=None, output_dtype=k.dtype)
+    w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=ai, cu_seqlens=None)
+    return w, u, ai
+
+
 def max_mean_err(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
     diff = (a.float() - b.float()).abs()
     return diff.max().item(), diff.mean().item()
@@ -100,22 +113,40 @@ def check_correctness(
     beta: torch.Tensor,
     a_raw: torch.Tensor,
     atol: float,
+    mode: str,
 ) -> None:
     print("Correctness:")
     w_ref, u_ref, ai_ref = run_original(k, v, beta, a_raw)
-    w_fused, u_fused, ai_fused = run_fused(k, v, beta, a_raw)
+
+    mode_fns = {
+        "fused": run_fused,
+        "hopper": run_hopper,
+    }
+    modes = {
+        "original": [],
+        "fused": ["fused"],
+        "hopper": ["hopper"],
+        "both": ["fused"],
+        "all": ["fused", "hopper"],
+    }[mode]
+    if not modes:
+        print("  original is the reference path; no alternate mode requested")
+        return
 
     passed = True
-    for name, ref, got in (
-        ("Ai", ai_ref, ai_fused),
-        ("W", w_ref, w_fused),
-        ("U", u_ref, u_fused),
-    ):
-        max_err, mean_err = max_mean_err(ref, got)
-        ok = max_err <= atol
-        passed = passed and ok
-        status = "OK" if ok else "FAIL"
-        print(f"  {name:<2} max_err={max_err:.6e} mean_err={mean_err:.6e} [{status}]")
+    for candidate in modes:
+        outputs = mode_fns[candidate](k, v, beta, a_raw)
+        w_got, u_got, ai_got = outputs
+        for name, ref, got in (
+            ("Ai", ai_ref, ai_got),
+            ("W", w_ref, w_got),
+            ("U", u_ref, u_got),
+        ):
+            max_err, mean_err = max_mean_err(ref, got)
+            ok = max_err <= atol
+            passed = passed and ok
+            status = "OK" if ok else "FAIL"
+            print(f"  {candidate:<6} {name:<2} max_err={max_err:.6e} mean_err={mean_err:.6e} [{status}]")
 
     if not passed:
         raise SystemExit(f"correctness failed with atol={atol}")
@@ -177,7 +208,7 @@ def print_device() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["original", "fused", "both"], default="both")
+    parser.add_argument("--mode", choices=["original", "fused", "hopper", "both", "all"], default="all")
     parser.add_argument("--batch", "-B", type=int, default=1)
     parser.add_argument("--seq", "-T", type=int, default=8192)
     parser.add_argument("--heads", "-H", type=int, default=32)
@@ -231,11 +262,11 @@ def main() -> None:
     torch.cuda.synchronize()
 
     if not args.skip_correctness:
-        check_correctness(k, v, beta, a_raw, args.atol)
+        check_correctness(k, v, beta, a_raw, args.atol, args.mode)
 
     print("Benchmark:")
     results: dict[str, list[float]] = {}
-    if args.mode in ("original", "both"):
+    if args.mode in ("original", "both", "all"):
         results["original"] = time_cuda_events(
             "original",
             lambda: run_original(k, v, beta, a_raw),
@@ -244,10 +275,19 @@ def main() -> None:
             repeats=args.repeats,
             profile=args.profile,
         )
-    if args.mode in ("fused", "both"):
+    if args.mode in ("fused", "both", "all"):
         results["fused"] = time_cuda_events(
             "fused",
             lambda: run_fused(k, v, beta, a_raw),
+            warmup=args.warmup,
+            n_iter=args.n_iter,
+            repeats=args.repeats,
+            profile=args.profile,
+        )
+    if args.mode in ("hopper", "all"):
+        results["hopper"] = time_cuda_events(
+            "hopper",
+            lambda: run_hopper(k, v, beta, a_raw),
             warmup=args.warmup,
             n_iter=args.n_iter,
             repeats=args.repeats,
@@ -261,6 +301,10 @@ def main() -> None:
         orig = statistics.mean(results["original"])
         fused = statistics.mean(results["fused"])
         print(f"RESULT speedup_fused_vs_original={orig / fused:.4f} saved_ms={orig - fused:.4f}")
+    if "original" in results and "hopper" in results:
+        orig = statistics.mean(results["original"])
+        hopper = statistics.mean(results["hopper"])
+        print(f"RESULT speedup_hopper_vs_original={orig / hopper:.4f} saved_ms={orig - hopper:.4f}")
 
 
 if __name__ == "__main__":

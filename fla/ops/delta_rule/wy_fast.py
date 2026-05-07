@@ -13,6 +13,11 @@ from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 USE_FUSED_SOLVE_WU = os.environ.get('FLA_USE_FUSED_SOLVE_WU', '1') != '0'
+_DEFAULT_SOLVE_WU_IMPL = 'fused' if USE_FUSED_SOLVE_WU else 'original'
+SOLVE_WU_IMPL = os.environ.get('FLA_SOLVE_WU_IMPL', _DEFAULT_SOLVE_WU_IMPL).lower()
+USE_HOPPER_SOLVE_TRIL = os.environ.get('FLA_USE_HOPPER_SOLVE_TRIL', '0') != '0'
+if USE_HOPPER_SOLVE_TRIL and 'FLA_SOLVE_WU_IMPL' not in os.environ:
+    SOLVE_WU_IMPL = 'hopper'
 
 
 @triton.heuristics({
@@ -198,9 +203,11 @@ def prepare_wy_repr_fwd(
     )
 
     if use_fused_kernel is None:
-        use_fused_kernel = USE_FUSED_SOLVE_WU
+        solve_wu_impl = SOLVE_WU_IMPL
+    else:
+        solve_wu_impl = 'fused' if use_fused_kernel else 'original'
 
-    if use_fused_kernel:
+    if solve_wu_impl == 'fused':
         from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
 
         # 🔥2.3 (fused): solve_tril + recompute_w_u in one kernel
@@ -212,7 +219,25 @@ def prepare_wy_repr_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
-    else:
+    elif solve_wu_impl == 'hopper':
+        from fla.ops.delta_rule.hopper_solve_tril import hopper_solve_tril
+
+        # 🔥2 (Hopper candidate): optimized triangular inverse, original W/U.
+        A = hopper_solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=k.dtype,
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+    elif solve_wu_impl == 'original':
         # 🔥2 + 🔥3 (original): separate kernels
         A = solve_tril(
             A=A,
@@ -228,6 +253,8 @@ def prepare_wy_repr_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
+    else:
+        raise ValueError(f"Unsupported FLA_SOLVE_WU_IMPL={solve_wu_impl!r}; expected original, fused, or hopper")
     return w, u, A
 
 
