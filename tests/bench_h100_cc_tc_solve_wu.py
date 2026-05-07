@@ -10,6 +10,11 @@ The input A = tril(beta * K K^T) is precomputed once so both paths measure only
 the solve+WU region. Use Nsight Compute/System around this script to check
 whether the fused Triton kernel improves wall time and whether H100 reports
 concurrent tensor-pipe and non-tensor-pipe activity.
+
+By default the synthetic K input is L2-normalized, matching the DeltaNet
+`qk_norm=l2` path. Raw Gaussian K can make the per-chunk triangular solve
+artificially ill-conditioned at large head dimensions, which is useful as a
+stress test but not representative of the model path we are benchmarking.
 """
 
 from __future__ import annotations
@@ -41,12 +46,16 @@ def generate_inputs(
     key_dim: int,
     value_dim: int,
     dtype: torch.dtype,
+    normalize_k: bool,
+    beta_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(1234)
     device = torch.device("cuda")
     k = torch.randn(batch, seq, heads, key_dim, dtype=dtype, device=device)
+    if normalize_k:
+        k = torch.nn.functional.normalize(k.float(), p=2, dim=-1).to(dtype)
     v = torch.randn(batch, seq, heads, value_dim, dtype=dtype, device=device)
-    beta = torch.rand(batch, seq, heads, dtype=torch.float32, device=device) * 0.1
+    beta = torch.rand(batch, seq, heads, dtype=torch.float32, device=device) * beta_scale
     return k, v, beta
 
 
@@ -179,6 +188,19 @@ def main() -> None:
     parser.add_argument("--n-iter", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--atol", type=float, default=2e-2)
+    parser.add_argument(
+        "--normalize-k",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="L2-normalize synthetic K, matching DeltaNet qk_norm=l2. Use "
+        "--no-normalize-k to reproduce the old raw-Gaussian stress input.",
+    )
+    parser.add_argument(
+        "--beta-scale",
+        type=float,
+        default=0.1,
+        help="Scale for synthetic beta sampled from U(0, beta_scale).",
+    )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--profile", action="store_true", help="Emit NVTX ranges around measured loops")
     args = parser.parse_args()
@@ -193,6 +215,7 @@ def main() -> None:
         f"K={args.key_dim} V={args.value_dim} dtype={args.dtype}"
     )
     print(f"  warmup={args.warmup} n_iter={args.n_iter} repeats={args.repeats}")
+    print(f"  normalize_k={args.normalize_k} beta_scale={args.beta_scale}")
 
     k, v, beta = generate_inputs(
         batch=args.batch,
@@ -201,6 +224,8 @@ def main() -> None:
         key_dim=args.key_dim,
         value_dim=args.value_dim,
         dtype=_dtype(args.dtype),
+        normalize_k=args.normalize_k,
+        beta_scale=args.beta_scale,
     )
     a_raw = make_a(k, beta)
     torch.cuda.synchronize()
