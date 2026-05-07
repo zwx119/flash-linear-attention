@@ -240,6 +240,25 @@ def prepare_wy_repr_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
+    elif solve_wu_impl == 'overlap':
+        from fla.ops.delta_rule.overlap_solve_tril_cuda import overlap_solve_tril
+
+        # 🔥2 (H100 overlap prototype): warp-specialized CC diagonal solve
+        # overlapped with tensor-core off-diagonal block products, original W/U.
+        A = overlap_solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=k.dtype,
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
     elif solve_wu_impl == 'original':
         # 🔥2 + 🔥3 (original): separate kernels
         A = solve_tril(
@@ -257,7 +276,7 @@ def prepare_wy_repr_fwd(
             chunk_indices=chunk_indices,
         )
     else:
-        raise ValueError(f"Unsupported FLA_SOLVE_WU_IMPL={solve_wu_impl!r}; expected original, fused, or hopper")
+        raise ValueError(f"Unsupported FLA_SOLVE_WU_IMPL={solve_wu_impl!r}; expected original, fused, hopper, or overlap")
     return w, u, A
 
 

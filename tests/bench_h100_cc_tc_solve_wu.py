@@ -6,6 +6,7 @@ This isolates the forward WY preparation hot section:
   original: solve_tril(A) + recompute_w_u(k, v, beta, Ai)
   fused:    fused_solve_wu(k, v, beta, A)
   hopper:   hopper_solve_tril(A) + recompute_w_u(k, v, beta, Ai)
+  overlap:  CUDA warp-specialized overlap_solve_tril(A) + recompute_w_u(...)
 
 The input A = tril(beta * K K^T) is precomputed once so both paths measure only
 the solve+WU region. Use Nsight Compute/System around this script to compare
@@ -30,6 +31,7 @@ import torch
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.delta_rule.fused_solve_wu import fused_solve_wu_fwd
 from fla.ops.delta_rule.hopper_solve_tril import hopper_solve_tril
+from fla.ops.delta_rule.overlap_solve_tril_cuda import overlap_solve_tril
 from fla.ops.delta_rule.wy_fast import recompute_w_u_fwd
 from fla.ops.utils.solve_tril import solve_tril
 
@@ -103,6 +105,17 @@ def run_hopper(
     return w, u, ai
 
 
+def run_overlap(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    a_raw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ai = overlap_solve_tril(A=a_raw, cu_seqlens=None, output_dtype=k.dtype)
+    w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=ai, cu_seqlens=None)
+    return w, u, ai
+
+
 def max_mean_err(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
     diff = (a.float() - b.float()).abs()
     return diff.max().item(), diff.mean().item()
@@ -122,13 +135,15 @@ def check_correctness(
     mode_fns = {
         "fused": run_fused,
         "hopper": run_hopper,
+        "overlap": run_overlap,
     }
     modes = {
         "original": [],
         "fused": ["fused"],
         "hopper": ["hopper"],
+        "overlap": ["overlap"],
         "both": ["fused"],
-        "all": ["fused", "hopper"],
+        "all": ["fused", "hopper", "overlap"],
     }[mode]
     if not modes:
         print("  original is the reference path; no alternate mode requested")
@@ -209,7 +224,7 @@ def print_device() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["original", "fused", "hopper", "both", "all"], default="original")
+    parser.add_argument("--mode", choices=["original", "fused", "hopper", "overlap", "both", "all"], default="original")
     parser.add_argument("--batch", "-B", type=int, default=1)
     parser.add_argument("--seq", "-T", type=int, default=8192)
     parser.add_argument("--heads", "-H", type=int, default=32)
@@ -294,6 +309,15 @@ def main() -> None:
             repeats=args.repeats,
             profile=args.profile,
         )
+    if args.mode in ("overlap", "all"):
+        results["overlap"] = time_cuda_events(
+            "overlap",
+            lambda: run_overlap(k, v, beta, a_raw),
+            warmup=args.warmup,
+            n_iter=args.n_iter,
+            repeats=args.repeats,
+            profile=args.profile,
+        )
 
     print("Summary:")
     for label, times in results.items():
@@ -306,6 +330,10 @@ def main() -> None:
         orig = statistics.mean(results["original"])
         hopper = statistics.mean(results["hopper"])
         print(f"RESULT speedup_hopper_vs_original={orig / hopper:.4f} saved_ms={orig - hopper:.4f}")
+    if "original" in results and "overlap" in results:
+        orig = statistics.mean(results["original"])
+        overlap = statistics.mean(results["overlap"])
+        print(f"RESULT speedup_overlap_vs_original={orig / overlap:.4f} saved_ms={orig - overlap:.4f}")
 
 
 if __name__ == "__main__":
