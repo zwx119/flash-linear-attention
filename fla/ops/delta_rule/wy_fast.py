@@ -12,7 +12,10 @@ from fla.ops.utils.solve_tril import solve_tril
 from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
-USE_FUSED_SOLVE_WU = os.environ.get('FLA_USE_FUSED_SOLVE_WU', '1') != '0'
+# The original FLA solve_tril + recompute path is still fastest in H100 tests.
+# Keep fused/hopper variants opt-in so training does not silently take a slower
+# experimental kernel.
+USE_FUSED_SOLVE_WU = os.environ.get('FLA_USE_FUSED_SOLVE_WU', '0') != '0'
 _DEFAULT_SOLVE_WU_IMPL = 'fused' if USE_FUSED_SOLVE_WU else 'original'
 SOLVE_WU_IMPL = os.environ.get('FLA_SOLVE_WU_IMPL', _DEFAULT_SOLVE_WU_IMPL).lower()
 USE_HOPPER_SOLVE_TRIL = os.environ.get('FLA_USE_HOPPER_SOLVE_TRIL', '0') != '0'

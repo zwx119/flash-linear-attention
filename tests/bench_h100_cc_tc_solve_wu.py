@@ -8,9 +8,10 @@ This isolates the forward WY preparation hot section:
   hopper:   hopper_solve_tril(A) + recompute_w_u(k, v, beta, Ai)
 
 The input A = tril(beta * K K^T) is precomputed once so both paths measure only
-the solve+WU region. Use Nsight Compute/System around this script to check
-whether the fused Triton kernel improves wall time and whether H100 reports
-concurrent tensor-pipe and non-tensor-pipe activity.
+the solve+WU region. Use Nsight Compute/System around this script to compare
+experimental fused or Hopper candidates against the original FLA path. Current
+H100 measurements show the original path is fastest; keep fused/hopper as
+explicit benchmark modes.
 
 By default the synthetic K input is L2-normalized, matching the DeltaNet
 `qk_norm=l2` path. Raw Gaussian K can make the per-chunk triangular solve
@@ -208,7 +209,7 @@ def print_device() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["original", "fused", "hopper", "both", "all"], default="all")
+    parser.add_argument("--mode", choices=["original", "fused", "hopper", "both", "all"], default="original")
     parser.add_argument("--batch", "-B", type=int, default=1)
     parser.add_argument("--seq", "-T", type=int, default=8192)
     parser.add_argument("--heads", "-H", type=int, default=32)
